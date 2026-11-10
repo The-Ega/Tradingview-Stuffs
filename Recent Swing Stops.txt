@@ -1,0 +1,119 @@
+//@version=6
+indicator("Swing Stop Levels", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────── Inputs ─────────────
+leftBars     = input.int(2, "Swing bars - left", minval = 1, group = "Swing")
+rightBars    = input.int(2, "Swing bars - right", minval = 1, group = "Swing")
+breakMode    = input.string("Wick", "Break condition", options = ["Wick", "Close"], group = "Swing", tooltip = "Wick = level is broken when price touches beyond it (like a real stop order triggering). Close = a candle must close beyond it.")
+
+mCandles     = input.int(12, "Monthly: recent candles", minval = 3, group = "Lookback")
+wCandles     = input.int(24, "Weekly: recent candles", minval = 3, group = "Lookback")
+dCandles     = input.int(48, "Daily: recent candles", minval = 3, group = "Lookback")
+intraSwings  = input.int(10, "4H/1H/15m/5m/1m: swings of each type", minval = 1, maxval = 100, group = "Lookback", tooltip = "Shows this many most recent swing highs AND this many most recent swing lows.")
+
+buyColor     = input.color(color.blue, "Buy Stop color (swing high)", group = "Style")
+sellColor    = input.color(color.red, "Sell Stop color (swing low)", group = "Style")
+lineWidth    = input.int(1, "Line width", minval = 1, maxval = 4, group = "Style")
+extendBars   = input.int(20, "Extend fresh lines past last candle (bars)", minval = 0, maxval = 200, group = "Style")
+brokenTransp = input.int(70, "Broken level transparency", minval = 0, maxval = 95, group = "Style")
+labelSize    = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Style")
+showPrice    = input.bool(false, "Show price in label", group = "Style")
+showBrokenLbl = input.bool(false, "Show labels on broken levels", group = "Style")
+
+lblSize = labelSize == "Tiny" ? size.tiny : labelSize == "Normal" ? size.normal : size.small
+
+// ───────────── Timeframe check ─────────────
+mult    = timeframe.multiplier
+isM     = timeframe.ismonthly and mult == 1
+isW     = timeframe.isweekly and mult == 1
+isD     = timeframe.isdaily and mult == 1
+isIntra = timeframe.isminutes and (mult == 240 or mult == 60 or mult == 15 or mult == 5 or mult == 1)
+validTF = isM or isW or isD or isIntra
+
+candleLimit = isM ? mCandles : isW ? wCandles : isD ? dCandles : 0
+dateFmt     = isM ? "MMM yyyy" : isIntra ? "dd MMM HH:mm" : "dd MMM yyyy"
+
+// ───────────── Level object ─────────────
+type Level
+    line  ln
+    label lb
+    float price
+    bool  isHigh
+    bool  active
+    int   pivBar
+
+var array<Level> highs = array.new<Level>()
+var array<Level> lows  = array.new<Level>()
+
+// Fresh: line + label sit extendBars past the latest candle.
+// Broken: line stops at the break candle, turns dashed & faded.
+method refresh(Level lv) =>
+    if lv.active
+        brokeUp = breakMode == "Wick" ? high > lv.price : close > lv.price
+        brokeDn = breakMode == "Wick" ? low < lv.price : close < lv.price
+        if (lv.isHigh and brokeUp) or (not lv.isHigh and brokeDn)
+            lv.active := false
+            fadedCol = color.new(lv.isHigh ? buyColor : sellColor, brokenTransp)
+            line.set_x2(lv.ln, bar_index)
+            label.set_x(lv.lb, bar_index)
+            line.set_style(lv.ln, line.style_dashed)
+            line.set_color(lv.ln, fadedCol)
+            label.set_textcolor(lv.lb, fadedCol)
+            if not showBrokenLbl
+                label.delete(lv.lb)
+        else
+            line.set_x2(lv.ln, bar_index + extendBars)
+            label.set_x(lv.lb, bar_index + extendBars)
+    lv
+
+method remove(Level lv) =>
+    line.delete(lv.ln)
+    label.delete(lv.lb)
+
+// Keep only what each timeframe should show
+prune(array<Level> arr) =>
+    if isIntra
+        while arr.size() > intraSwings
+            arr.shift().remove()
+    else if barstate.islast
+        windowStart = bar_index - candleLimit + 1
+        while arr.size() > 0 and arr.first().pivBar < windowStart
+            arr.shift().remove()
+    arr.size()
+
+newLevel(float price, bool isHigh, int pivBar, string dateStr) =>
+    col = isHigh ? buyColor : sellColor
+    ln  = line.new(pivBar, price, bar_index + extendBars, price, color = col, width = lineWidth)
+    txt = (isHigh ? "BUY STOP" : "SELL STOP") + " · " + dateStr + (showPrice ? " · " + str.tostring(price, format.mintick) : "")
+    lb  = label.new(bar_index + extendBars, price, txt, color = color.new(col, 100), textcolor = col, size = lblSize, style = label.style_label_left)
+    Level.new(ln, lb, price, isHigh, true, pivBar)
+
+// ───────────── Update existing levels ─────────────
+if validTF
+    for lv in highs
+        lv.refresh()
+    for lv in lows
+        lv.refresh()
+
+// ───────────── Swing detection ─────────────
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low, leftBars, rightBars)
+
+pivBar  = bar_index - rightBars
+dateStr = str.format_time(time[rightBars], dateFmt, syminfo.timezone)
+inRange = isIntra or pivBar >= last_bar_index - candleLimit + 1
+
+if validTF and inRange
+    if not na(ph)
+        highs.push(newLevel(ph, true, pivBar, dateStr))
+    if not na(pl)
+        lows.push(newLevel(pl, false, pivBar, dateStr))
+
+if validTF
+    prune(highs)
+    prune(lows)
+
+// ───────────── Warning on unsupported timeframes ─────────────
+var table warn = table.new(position.top_right, 1, 1)
+if barstate.islast and not validTF
+    table.cell(warn, 0, 0, "Swing Stop Levels: use M, W, D, 4H, 1H, 15m, 5m or 1m", bgcolor = color.orange, text_color = color.white)
